@@ -1,0 +1,9 @@
+﻿.idea
+lms 제출물
+github 과제점검
+*/__pycache__
+*/*/__pycache__/*
+
+# 대용량 과제 파일
+*.zip
+과제점검/output/

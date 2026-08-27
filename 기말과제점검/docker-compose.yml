@@ -1,0 +1,18 @@
+name: streamlit-app
+
+services:
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: "1006:1006"
+    ports:
+      - "8180:8501"
+    environment:
+      - LMS_DIR=/app/lms 제출물
+      - TASK_DIR=/app/과제점검
+      - HOME=/tmp
+    volumes:
+      - "../lms 제출물:/app/lms 제출물"
+      - "../과제점검:/app/과제점검"
+    restart: unless-stopped

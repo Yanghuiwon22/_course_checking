@@ -1,0 +1,4 @@
+아래 3개 프로그램을 완성하시오.
+1) ASCII 코드를 이용하여 입력받은 문자열을 대문자는 소문자로, 소문자는 대문자로 바꾸시오. 함수명은 toggle_text(text: str) -> str
+2) ASCII 코드를 이용하여 카이사르 암호(Caesar cipher)를 구현하시오. 카이사르 암호는 그림과 같이 각 알파벳을 일정한 거리만큼 밀어서 다른 알파벳으로 대치하는 방법으로 3칸을 옮겼을 때, 오른쪽 아래 그림과 같다.  caesar_encode(text: str, shift: int = 3) -> str caesar_decode(text: str, shift: int = 3) -> str 예시) caesar_encode(“ABC”) == “DEF” caesar_decode(“Def”) == “Abc”  
+3) 초성 게임을 완성하시오. 유니코드를 이용하여, 주어진 단어 뭉치에서 단어를 하나 선택하고, 초성을 제시한다. 사용자는 주어진 초성을 보고 주어진 단어를 맞추는 게임을 구현한다.
