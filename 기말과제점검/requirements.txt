@@ -1,6 +1,0 @@
-streamlit
-python-dotenv
-selenium
-onetimepass
-openpyxl
-gspread

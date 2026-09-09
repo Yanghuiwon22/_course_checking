@@ -1,2 +1,0 @@
-과제 #19의 4개 코드의 input()를gui_input()으로 바꾸거나, rich, PySimpleGUI등으로 입출력을 꾸며서 다시구현하시오。
--- github에도 업로드 부탁드립니다.

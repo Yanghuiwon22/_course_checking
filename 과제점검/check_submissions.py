@@ -6,14 +6,17 @@ lms_제출_점검 Google Sheets 제출/미제출 현황 업데이트 스크립�
     python check_submissions.py
 """
 
+import re
 from pathlib import Path
 import openpyxl
 import gspread
 from gspread.utils import rowcol_to_a1
 
-from config import (SPREADSHEET_ID, SHEET_GID, LMS_DIR as STUDENT_DIR,
-                    ROSTER_PATH, CREDS_PATH, COL_STUDENT_NAME as ROSTER_COL)
-from utils import normalize_name
+from config import (SPREADSHEET_ID, SHEET_GID, LMS_DIR as STUDENT_DIR, COL_STUDENT_ID,
+                    ROSTER_PATH, CREDS_PATH, COL_STUDENT_NAME as ROSTER_COL,
+                    RUBRICS, LMS_ZIP_DIR)
+from utils import load_roster_rows, resolve_student_dir, student_dirname
+from check_hw_rubric import find_hw_zip, load_submit_times
 
 def hex_rgb(h):
     h = h.lstrip('#')
@@ -229,7 +232,8 @@ def apply_formatting(sh, sheet_gid, num_data_rows, num_data_cols,
     sh.batch_update({'requests': R})
 
 
-def update_submission_checklist(spreadsheet_id, sheet_gid, student_names, student_dir_root, creds_path):
+def update_submission_checklist(spreadsheet_id, sheet_gid, students, student_dir_root, creds_path):
+    """students: [(이름, 학번), ...] — 폴더는 utils.resolve_student_dir 규칙으로 찾는다."""
     gc = gspread.service_account(filename=str(creds_path))
     sh = gc.open_by_key(spreadsheet_id)
     ws = next(w for w in sh.worksheets() if w.id == sheet_gid)
@@ -272,6 +276,37 @@ def update_submission_checklist(spreadsheet_id, sheet_gid, student_names, studen
     for i, hw in enumerate(new_hw):
         hw_col[hw] = next_col + i
 
+    # 과제별 마감시각(config.RUBRICS)이 있으면 실제 제출 ZIP의 타임스탬프로 지각을 판정한다.
+    # 마감 정보가 없는 과제(예: GitHub 기반 프원실 과제)는 기존처럼
+    # '이전엔 미제출 -> 지금은 제출'이라는 사실만으로 지각을 추정한다.
+    deadline_by_hw: dict[str, object] = {}
+    submit_times_by_hw: dict[str, dict] = {}
+    for hw in all_hw:
+        m = re.match(r'hw0*(\d+)$', hw)
+        if not m:
+            continue
+        hw_num = int(m.group(1))
+        deadline = RUBRICS.get(hw_num, {}).get('deadline')
+        if not deadline:
+            continue
+        zip_path = find_hw_zip(LMS_ZIP_DIR, hw_num)
+        if zip_path is None:
+            continue
+        deadline_by_hw[hw] = deadline
+        submit_times_by_hw[hw] = load_submit_times(zip_path)
+
+    def submission_status(name: str, hw: str, hw_dir: Path) -> str:
+        """'-' / '지각' / '미제출' 중 하나. 마감 정보가 있으면 실제 제출 시각으로 판정한다."""
+        has_files = hw_dir.is_dir() and any(f.is_file() for f in hw_dir.iterdir())
+        if not has_files:
+            return '미제출'
+        times = submit_times_by_hw.get(hw)
+        if times:
+            key = next((k for k in times if k.startswith(name)), None)
+            if key and times[key] > deadline_by_hw[hw]:
+                return '지각'
+        return '-'
+
     value_updates = []
     red_cells = []
     plain_cells = []
@@ -284,32 +319,37 @@ def update_submission_checklist(spreadsheet_id, sheet_gid, student_names, studen
         value_updates.append({'range': rowcol_to_a1(1, next_col + i), 'values': [[hw]]})
 
     new_rows = []
-    for name in student_names:
-        name = name.split(' ')[0]
-        is_new = name not in name_to_row
+    for name, sid in students:
+        label = student_dirname(name, sid)      # 시트에 표기할 이름(학번)
+        is_new = label not in name_to_row
         if not is_new:
-            row_idx = name_to_row[name]
-            hws_to_fill = new_hw
+            row_idx = name_to_row[label]
+            # 마감 정보가 있는 hw는 매번 실제 제출 시각으로 다시 계산한다 (자가교정).
+            # 마감 정보가 없는 hw는 기존처럼 새로 생긴 열만 채운다 (불필요한 재조회 방지).
+            hws_to_fill = list(dict.fromkeys(new_hw + [hw for hw in deadline_by_hw if hw not in new_hw]))
         else:
             current_max_row += 1
             row_idx = current_max_row
-            name_to_row[name] = row_idx
-            value_updates.append({'range': rowcol_to_a1(row_idx, 1), 'values': [[name]]})
+            name_to_row[label] = row_idx
+            value_updates.append({'range': rowcol_to_a1(row_idx, 1), 'values': [[label]]})
             new_rows.append(row_idx)
             hws_to_fill = all_hw
 
         for hw in hws_to_fill:
-            hw_dir = student_dir_root / name / hw
-            has_files = hw_dir.is_dir() and any(f.is_file() for f in hw_dir.iterdir())
+            hw_dir = resolve_student_dir(student_dir_root, name, sid) / hw
             col = hw_col[hw]
-            if has_files:
-                value_updates.append({'range': rowcol_to_a1(row_idx, col), 'values': [['-']]})
-                plain_cells.append((row_idx, col))
-            else:
-                value_updates.append({'range': rowcol_to_a1(row_idx, col), 'values': [['미제출']]})
+            status = submission_status(name, hw, hw_dir)
+            value_updates.append({'range': rowcol_to_a1(row_idx, col), 'values': [[status]]})
+            if status == '미제출':
                 red_cells.append((row_idx, col))
+            elif status == '지각':
+                yellow_cells.append((row_idx, col))
+            else:
+                plain_cells.append((row_idx, col))
 
-        # 기존 열: 이전에 미제출 -> 현재 제출이면 "지각"으로 표기
+        # 기존 열: 이전에 미제출 -> 현재 제출로 바뀐 경우만 다시 확인한다.
+        # 마감 정보가 있으면 실제 제출 시각으로 '-'/'지각'을 정확히 가리고,
+        # 없으면 예전처럼 '미제출->제출 전환' 자체를 지각으로 간주한다.
         if not is_new:
             row_values = all_values[row_idx - 1] if row_idx - 1 < len(all_values) else []
             for hw in all_hw:
@@ -319,11 +359,15 @@ def update_submission_checklist(spreadsheet_id, sheet_gid, student_names, studen
                 prev_val = row_values[col - 1] if col - 1 < len(row_values) else ''
                 if prev_val != '미제출':
                     continue
-                hw_dir = student_dir_root / name / hw
-                has_files = hw_dir.is_dir() and any(f.is_file() for f in hw_dir.iterdir())
-                if has_files:
-                    value_updates.append({'range': rowcol_to_a1(row_idx, col), 'values': [['지각']]})
+                hw_dir = resolve_student_dir(student_dir_root, name, sid) / hw
+                if not (hw_dir.is_dir() and any(f.is_file() for f in hw_dir.iterdir())):
+                    continue
+                status = submission_status(name, hw, hw_dir) if hw in deadline_by_hw else '지각'
+                value_updates.append({'range': rowcol_to_a1(row_idx, col), 'values': [[status]]})
+                if status == '지각':
                     yellow_cells.append((row_idx, col))
+                elif status == '-':
+                    plain_cells.append((row_idx, col))
 
     if value_updates:
         ws.batch_update(value_updates)
@@ -344,12 +388,9 @@ def update_submission_checklist(spreadsheet_id, sheet_gid, student_names, studen
 
 
 def main():
-    wb = openpyxl.load_workbook(ROSTER_PATH, read_only=True, data_only=True)
-    idx = ROSTER_COL - 1
-    names = [normalize_name(row[idx].value) for row in wb.active.iter_rows(min_row=2) if row[idx].value]
-    wb.close()
-
-    update_submission_checklist(SPREADSHEET_ID, SHEET_GID, names, STUDENT_DIR, CREDS_PATH)
+    students = load_roster_rows(ROSTER_PATH, ROSTER_COL, COL_STUDENT_ID)
+    update_submission_checklist(SPREADSHEET_ID, SHEET_GID, students,
+                                STUDENT_DIR, CREDS_PATH)
 
 
 if __name__ == '__main__':

@@ -1,9 +1,9 @@
-﻿"""
-JBNU LMS 자동 로그인 및 과제 제출물 다운로드 스크립트.
+"""
+JBNU LMS 과제 제출물 다운로드 스크립트 (반자동).
 
-이 스크립트는 Selenium과 python-dotenv를 활용하여
-.env 파일에 저장된 사용자 자격 증명으로 LMS에 자동 로그인 후
-지정한 주차의 과제 제출물을 일괄 다운로드합니다.
+학교 SSO가 패스키 인증을 요구하므로 로그인은 무인화할 수 없다.
+Chrome 프로필을 고정해 세션을 재사용하며, 세션이 없을 때만 브라우저를 띄워
+사용자가 직접 패스키 인증을 한다. 인증 이후의 다운로드·분류는 전부 자동이다.
 """
 
 import os
@@ -12,14 +12,14 @@ import shutil
 import time
 import zipfile
 from pathlib import Path
-from dotenv import load_dotenv
+from config import (BASE_DIR, OUTPUT_DIR, LMS_DIR, ROSTER_PATH,
+                    COL_STUDENT_NAME, CHROME_PROFILE_DIR, LOGIN_WAIT_SEC)
 import openpyxl
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException, StaleElementReferenceException
-from selenium.webdriver.common.keys import Keys
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
 
 def normalize_name(raw: str) -> str:
@@ -49,21 +49,48 @@ def init_student_dirs(roster_path: Path, student_dir_root: Path, roster_col: int
 
 
 
-def login_to_lms(user_id: str, user_pw: str, otp_secret: str = None, options: webdriver.ChromeOptions = None) -> webdriver.Chrome:
+LOGIN_URL = "https://lms.jbnu.ac.kr/login/index.php"
+LMS_HOME  = "https://lms.jbnu.ac.kr/"
+
+
+def is_logged_in(driver: webdriver.Chrome) -> bool:
+    """Moodle이 body에 붙이는 notloggedin 클래스로 로그인 여부를 판정한다."""
+    try:
+        cls = driver.find_element(By.TAG_NAME, "body").get_attribute("class") or ""
+    except WebDriverException:
+        return False
+    return "notloggedin" not in cls
+
+
+def login_to_lms(profile_dir: Path, download_dir: Path,
+                 wait_sec: int = 300) -> webdriver.Chrome:
     """
-    제공된 아이디와 비밀번호로 JBNU LMS 홈페이지에 로그인합니다.
+    프로필을 고정한 Chrome으로 LMS에 로그인한다.
+
+    저장된 세션이 살아 있으면 그대로 통과하고, 없으면 JUMP 로그인 화면을 띄운 뒤
+    사용자가 패스키 인증을 마칠 때까지 기다린다. (학교 SSO가 패스키를 요구하므로
+    이 단계는 자동화할 수 없다 — 인증은 사용자가 직접 수행한다.)
+
+    Args:
+        profile_dir  : Chrome 사용자 프로필 경로 (로그인 세션이 여기에 저장된다)
+        download_dir : 파일 다운로드 경로
+        wait_sec     : 패스키 인증 대기 상한(초)
 
     Returns:
-        webdriver.Chrome: 로그인 완료된 브라우저 드라이버 객체
-    """
-    login_url = "https://lms.jbnu.ac.kr/login/index.php"
+        로그인이 확인된 드라이버
 
-    if options is None:
-        options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1920,1080")
+    Raises:
+        RuntimeError: 드라이버를 띄우지 못했거나 대기 시간 내에 로그인되지 않은 경우
+    """
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    options = webdriver.ChromeOptions()
+    options.add_argument(f"--user-data-dir={profile_dir.resolve()}")
+    options.add_argument("--window-size=1280,900")
+    options.add_experimental_option("prefs", {
+        "download.default_directory": str(download_dir.resolve()),
+        "download.prompt_for_download": False,
+    })
 
     chrome_bin = os.environ.get("CHROME_BIN")
     if chrome_bin:
@@ -73,99 +100,41 @@ def login_to_lms(user_id: str, user_pw: str, otp_secret: str = None, options: we
         from selenium.webdriver.chrome.service import Service
         chromedriver = os.environ.get("CHROMEDRIVER_PATH")
         service = Service(chromedriver) if chromedriver else None
-        driver = webdriver.Chrome(options=options, **({"service": service} if service else {}))
+        driver = webdriver.Chrome(options=options,
+                                  **({"service": service} if service else {}))
     except WebDriverException as e:
-        print(f"[오류] Chrome WebDriver를 초기화할 수 없습니다: {e}")
-        return None
+        raise RuntimeError(f"Chrome WebDriver를 초기화할 수 없습니다: {e}") from e
 
     try:
-        print(f"[{login_url}] 접속 중...")
-        driver.get(login_url)
+        driver.get(LMS_HOME)
+        WebDriverWait(driver, 20).until(
+            lambda d: d.execute_script("return document.readyState") == "complete")
 
-        wait = WebDriverWait(driver, 10)
+        if is_logged_in(driver):
+            print("저장된 세션으로 로그인 상태 확인. 바로 진행합니다.")
+            return driver
 
-        print("아이디와 비밀번호 입력 중...")
-        id_input = wait.until(EC.presence_of_element_located((By.ID, "input-username")))
-        id_input.clear()
-        id_input.send_keys(user_id)
+        # 세션 없음 → 로그인 페이지만 띄우고 사용자가 직접 로그인하도록 기다린다.
+        # (버튼 클릭까지 자동화하지 않는다 — SSO가 자동 조작을 거부한다)
+        driver.get(LOGIN_URL)
 
-        pw_input = wait.until(EC.presence_of_element_located((By.ID, "input-password")))
-        pw_input.clear()
-        pw_input.send_keys(user_pw)
+        print("=" * 56)
+        print("  브라우저에서 직접 로그인해 주세요.")
+        print("  전북대 JUMP 로그인 → 아이디 입력 → 패스키 인증")
+        print(f"  최대 {wait_sec}초 대기합니다. (완료되면 자동으로 진행)")
+        print("=" * 56)
 
-        print("로그인 버튼 클릭 시도 (엔터키 전송)...")
-        pw_input.send_keys(Keys.RETURN)
-        print("로그인 동작이 완료되었습니다.")
+        deadline = time.time() + wait_sec
+        while time.time() < deadline:
+            if "lms.jbnu.ac.kr" in driver.current_url and is_logged_in(driver):
+                print(f"로그인 확인. (URL: {driver.current_url})")
+                return driver
+            time.sleep(2)
 
-        if otp_secret:
-            print("OTP 인증 설정이 확인되었습니다. 인증번호 생성을 시도합니다...")
-            import onetimepass as otp
-
-            # 서버 시계 오차 보정: NTP로 정확한 UTC 시각 획득
-            try:
-                import ntplib
-                ntp_time = ntplib.NTPClient().request('pool.ntp.org', version=3).tx_time
-                print(f"NTP 시각 동기화 성공: {ntp_time}")
-            except Exception as e:
-                import time
-                ntp_time = time.time()
-                print(f"NTP 동기화 실패 ({e}), 시스템 시각 사용")
-
-            my_token = str(otp.get_totp(otp_secret, clock=int(ntp_time))).zfill(6)
-            print(f"생성된 OTP 인증번호: {my_token} 입력 중...")
-
-            try:
-                otp_xpath = "/html/body/div[2]/div[2]/div/div/section/div/div[2]/form/div[2]/div[2]/input"
-                time.sleep(3)
-
-                success = False
-                for attempt in range(5):
-                    try:
-                        # OTP 만료 방지: 매 시도마다 토큰 재생성
-                        my_token = str(otp.get_totp(otp_secret)).zfill(6)
-                        otp_input = wait.until(EC.presence_of_element_located((By.XPATH, otp_xpath)))
-                        # JS로 값 주입 + 이벤트 발생 (stale 방지)
-                        driver.execute_script("""
-                            arguments[0].value = arguments[1];
-                            arguments[0].dispatchEvent(new Event('input', {bubbles: true}));
-                            arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
-                        """, otp_input, my_token)
-                        # submit 버튼 클릭 (Enter 대신)
-                        try:
-                            submit_btn = driver.find_element(By.CSS_SELECTOR, "form button[type='submit'], form input[type='submit']")
-                            submit_btn.click()
-                        except Exception:
-                            driver.execute_script("arguments[0].form.submit()", otp_input)
-                        # URL이 mfa 페이지를 벗어날 때까지 대기
-                        from selenium.webdriver.support.ui import WebDriverWait as WDW
-                        try:
-                            WDW(driver, 10).until(lambda d: "mfa" not in d.current_url)
-                            print(f"OTP 인증 성공. 현재 URL: {driver.current_url}")
-                        except Exception:
-                            print(f"[경고] OTP 제출 후 페이지 미전환. 현재 URL: {driver.current_url}")
-                        success = True
-                        break
-                    except StaleElementReferenceException:
-                        print(f"Stale 오류, 재시도 중... ({attempt + 1}/5)")
-                        time.sleep(1)
-                if success:
-                    print("OTP 인증번호 전송 완료.")
-                else:
-                    print("[경고] OTP 입력 5회 모두 실패.")
-            except TimeoutException:
-                print("OTP 입력창을 찾지 못했습니다.")
-            except Exception as e:
-                print(f"OTP 처리 중 기타 오류 발생: {e}")
-
-        time.sleep(3)
-
-    except TimeoutException:
-        print("[오류] 페이지 로딩 또는 요소를 찾는데 시간이 초과되었습니다.")
-    except Exception as e:
-        print(f"[오류] 로그인 처리 중 알 수 없는 오류 발생: {e}")
-    finally:
-        print("로그인 프로세스 종료")
-        return driver
+        raise RuntimeError(f"{wait_sec}초 안에 로그인이 완료되지 않았습니다.")
+    except Exception:
+        driver.quit()
+        raise
 
 
 def run_task(driver: webdriver.Chrome, course_name: str, download_dir: Path, txt_dir: Path, student_dir_root: Path, student_names: list) -> None:
@@ -333,53 +302,29 @@ def run_task(driver: webdriver.Chrome, course_name: str, download_dir: Path, txt
 
 
 def main(TARGET_COURSE, TARGET_WEEK) -> None:
-# def main() -> None:
-
     """
-    메인 실행 함수.
+    LMS 제출물 다운로드 진입점.
+
+    로그인은 반자동이다 — 저장된 세션이 없으면 브라우저가 열리고,
+    사용자가 패스키 인증을 마친 뒤 자동으로 다운로드가 진행된다.
     """
-    # ────── 사용자 설정 ──────
-    TARGET_COURSE = TARGET_COURSE
-    TARGET_WEEK   = TARGET_WEEK
-    DOWNLOAD_DIR  = Path('.') / 'output' / TARGET_WEEK                        # ZIP 임시 저장
-    TXT_DIR       = Path('..') / '과제점검' / '과제모음'                       # 과제 설명 txt
-    STUDENT_DIR    = Path('..') / 'lms 제출물'                                 # 학생별 폴더 루트
-    ROSTER_PATH    = Path('..') / '과제점검' / '프원실(2026)_과제확인.xlsx'      # 수강생 명단
-    ROSTER_COL     = 5                                                      # 학생 영문 이름(1-based)
-    # ─────────────────────────
-
-    env_path = Path('.') / '.env'
-    load_dotenv(dotenv_path=env_path)
-
-    user_id = os.environ.get("LMS_USER_ID")
-    user_pw = os.environ.get("LMS_USER_PW")
-    otp_secret = os.environ.get("LMS_OTP_SECRET")
-
-    if not user_id or not user_pw:
-        print("[오류] .env 파일에 LMS_USER_ID 또는 LMS_USER_PW가 설정되지 않았습니다.")
-        return
+    DOWNLOAD_DIR = OUTPUT_DIR / TARGET_WEEK              # ZIP 임시 저장
+    TXT_DIR      = BASE_DIR / '과제모음'                  # 과제 설명 txt
+    STUDENT_DIR  = LMS_DIR                               # 학생별 폴더 루트
 
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     TXT_DIR.mkdir(parents=True, exist_ok=True)
 
-    student_names = init_student_dirs(ROSTER_PATH, STUDENT_DIR, ROSTER_COL)
+    student_names = init_student_dirs(ROSTER_PATH, STUDENT_DIR, COL_STUDENT_NAME)
 
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1920,1080")
-    options.add_experimental_option("prefs", {
-        "download.default_directory": str(DOWNLOAD_DIR.resolve()),
-        "download.prompt_for_download": False,
-    })
-
-    driver = login_to_lms(user_id, user_pw, otp_secret, options=options)
-
-    if driver:
-        run_task(driver, TARGET_COURSE, DOWNLOAD_DIR, TXT_DIR, STUDENT_DIR, student_names)
+    driver = login_to_lms(CHROME_PROFILE_DIR, DOWNLOAD_DIR, LOGIN_WAIT_SEC)
+    try:
+        run_task(driver, TARGET_COURSE, DOWNLOAD_DIR, TXT_DIR,
+                 STUDENT_DIR, student_names)
+    finally:
+        driver.quit()
 
 
 if __name__ == "__main__":
-    main("프로그래밍원리와실습", '16주차')
-
+    from config import TARGET_COURSE, TARGET_WEEK
+    main(TARGET_COURSE, TARGET_WEEK)
